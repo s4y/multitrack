@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<style>
+
+html {
+  color: white;
+  background: #222;
+  font: 14px system-ui;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  height: 100vh;
+  margin: 0;
+}
+
+#dropzone {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  font-size: 2em;
+}
+
+body[data-state]:not([data-state=""]) #dropzone {
+  display: none;
+}
+
+body:not([data-state=loaded]) #tracks {
+  display: none;
+}
+
+.track {
+  flex: 1 0 4em;
+  display: flex;
+  padding-left: 0.25em;
+  overflow: hidden;
+  margin: 0.25em 0;
+}
+
+button {
+  margin: 0 0.25em;
+  font: inherit;
+  border: none;
+  background: #555;
+  color: inherit;
+  font-weight: bold;
+}
+
+button.active {
+  color: #333;
+  background: white;
+}
+
+#tracks {
+  margin-bottom: 3em;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+#viz {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+}
+
+.track > button {
+  width: 3em;
+}
+
+.track > .right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.track .label {
+  background: black;
+  padding: 0.25em;
+}
+
+.track .canvasPlaceholder {
+  flex: 1;
+}
+
+.transport {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  height: 3em;
+  align-items: center;
+  background: #333;
+}
+
+.transport .scrubber {
+  flex: 1;
+}
+
+.transport .ts {
+  margin: 0 0.5em;
+  min-width: 3em;
+  text-align: center;
+}
+
+</style>
+<body>
+<div id=dropzone>Drag and drop your tracks here.</div>
+<div id=tracks><canvas id=viz></canvas></div>
+<template id=transportTemplate><div class=transport>
+  <button class="playPause">Play</button>
+  <div class="ts currentTime">-:--</div>
+  <input type=range class=scrubber min=0 max=0></input>
+  <div class="ts totalTime">-:--</div>
+  </div></template>
+<template id=trackTemplate><div class=track>
+  <button class=mute>M</button>
+  <button class=solo>S</button>
+  <div class=right>
+    <div class=label></div>
+    <div class=canvasPlaceholder></div>
+  </div>
+</div></template>
+<script>
+
+const formatDuration = d => {
+  const m = Math.floor(d / 60);
+  const s = Math.floor(d) % 60;
+  return `${m.toFixed()}:${s.toFixed().padStart(2, '0')}`;
+};
+
+class Transport {
+  constructor(ac, players) {
+    this.ac = ac;
+    this.players = players;
+    this.duration = this.players[0].buf.duration;
+    this.el = transportTemplate.content.firstChild.cloneNode(true);
+    this.scrubber = this.el.querySelector('.scrubber');
+    this.currentTimeEl = this.el.querySelector('.currentTime');
+    this.el.querySelector('.totalTime').textContent = formatDuration(this.duration);
+    this.scrubber.max = this.duration;
+    this.scrubber.addEventListener('input', e => {
+      this.play();
+    });
+    this.playPauseButton = this.el.querySelector('.playPause');
+    this.playPauseButton.addEventListener('click', e => {
+      const playing = this.startTime != null;
+      if (playing)
+        this.pause();
+      else
+        this.play();
+    });
+    this.startTime = null;
+    this.updateInterval = null;
+  }
+  updateTransport() {
+    const playing = this.startTime != null;
+    this.playPauseButton.textContent = playing ? 'Pause' : 'Play';
+    const currentTime = playing ? ac.currentTime - this.startTime : 0;
+      if (playing && currentTime > this.duration) {
+      this.startTime = null;
+      this.updateTransport();
+      return;
+    }
+    if (playing && !this.updateInterval) {
+      this.updateInterval = setInterval(() => this.updateTransport(), 1000);
+    } else if (!playing && this.updateInterval) {
+      clearInterval(this.updateInterval);
+      this.updateInterval = null;
+    }
+
+    this.scrubber.valueAsNumber = currentTime;
+    this.currentTimeEl.textContent = formatDuration(currentTime);
+  }
+  play() {
+    const now = this.ac.currentTime;
+      const playFrom = this.el.querySelector('.scrubber').valueAsNumber;
+    for (const player of this.players) {
+      player.play(now, playFrom);
+    }
+    this.startTime = now - playFrom;
+    this.updateTransport();
+  }
+  pause() {
+    for (const player of this.players)
+      player.stop();
+    this.startTime = null;
+    this.updateTransport();
+  }
+}
+
+const planeMesh = new Float32Array([
+  -1, 1, 0, -1, -1, 0,
+  1, 1, 0, 1, -1, 0,
+]);
+
+class SpectrumViewer {
+  constructor(canvasEl) {
+    this.players = [];
+    this.canvasEl = canvasEl;
+    this.gl = canvasEl.getContext('webgl', {
+      powerPreference: 'low-power',
+    });
+    this.initGl();
+  }
+
+  get vs() {
+    return `
+    attribute vec3 p_in;
+    varying vec3 p;
+    uniform vec4 rect;
+
+    void main() {
+      p = p_in;
+      gl_Position = vec4(p_in, 1.);
+      gl_Position.xy += vec2(1., -1.);
+      gl_Position.xy *= rect.zw * 2.;
+      gl_Position.xy -= vec2(1., -1.);
+      gl_Position.xy += rect.xy * vec2(4., -4.);
+    }
+    `;
+  }
+
+  get fs() {
+    return `
+    precision mediump float;
+    varying vec3 p;
+    uniform sampler2D sf;
+
+    void main() {
+      gl_FragColor = vec4(texture2D(sf, vec2(p.x/2.+.5)));
+    }
+    `;
+  }
+
+  initGl() {
+    const {gl} = this;
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, this.vs);
+    gl.compileShader(vs);
+    // console.log(gl.getShaderInfoLog(vs));
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, this.fs);
+    gl.compileShader(fs);
+    // console.log(gl.getShaderInfoLog(fs));
+    const prog = this.prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    // if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    //   console.log(gl.getProgramInfoLog(prog));
+    //   return;
+    // }
+    gl.useProgram(prog);
+    this.rectLoc = gl.getUniformLocation(prog, "rect");
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, planeMesh, gl.STATIC_DRAW);
+
+    const pLoc = gl.getUniformLocation(prog, "p_in");
+    gl.enableVertexAttribArray(pLoc);
+    gl.vertexAttribPointer(pLoc, 3, gl.FLOAT, false, 0, 0);
+
+    const tex = gl.createTexture();
+    const sfLoc = gl.getUniformLocation(this.prog, 'sf');
+    gl.uniform1i(sfLoc, tex);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    this.resize();
+  }
+
+  resize() {
+    const {canvasEl, gl} = this;
+    canvasEl.width = canvasEl.clientWidth * devicePixelRatio;
+    canvasEl.height = canvasEl.clientHeight * devicePixelRatio;
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+  }
+
+  draw(buf, rect) {
+    const {canvasEl, gl} = this;
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.LUMINANCE,
+      buf.length, 1, 0,
+      gl.LUMINANCE, gl.UNSIGNED_BYTE, buf
+    );
+    gl.uniform4f(this.rectLoc,
+      rect[0]/canvasEl.width,
+      rect[1]/canvasEl.height,
+      rect[2]/canvasEl.width,
+      rect[3]/canvasEl.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, planeMesh.length / 3);
+  }
+
+  onAnimationFrame() {
+    const {gl} = this;
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    for (const player of this.players)
+      this.draw(player.getFreqBuf(), player.getDrawRect());
+    this.animationFrame = requestAnimationFrame(() => this.onAnimationFrame());
+  }
+}
+
+const spectrumViewer = new SpectrumViewer(viz);
+window.addEventListener('resize', e => {
+  spectrumViewer.resize();
+});
+
+const kMaxFrequency = 20000;
+
+let allTracks = [];
+let soloTracks = new Set();
+  
+class StemPlayer {
+  constructor(ac, name, buf) {
+    allTracks.push(this);
+    this.ac = ac;
+    this.buf = buf;
+    this.el = trackTemplate.content.firstChild.cloneNode(true);
+    this.canvasPlaceholderEl = this.el.querySelector('.canvasPlaceholder');
+    this.el.querySelector('.label').textContent = name;
+
+    this.analyzer = ac.createAnalyser();
+    this.freqBuf = new Uint8Array(Math.floor(kMaxFrequency / ac.sampleRate * (this.analyzer.fftSize / 2)));
+
+    this.muteButton = this.el.querySelector('.mute');
+    this.mute = false;
+    this.muteButton.addEventListener('click', e => {
+      this.toggleMute();
+    });
+    this.soloButton = this.el.querySelector('.solo');
+    this.soloButton.addEventListener('click', e => {
+      this.toggleSolo();
+    });
+    this.effectivelyMute = false;
+  }
+  updateEffectivelyMute() {
+    const wasEffectivelyMute = this.effectivelyMute;
+    this.effectivelyMute = this.mute || (soloTracks.size && !soloTracks.has(this));
+    if (this.effectivelyMute == wasEffectivelyMute)
+      return;
+    if (!this.node)
+      return;
+    if (this.effectivelyMute)
+      this.node.disconnect(this.ac.destination);
+    else
+      this.node.connect(this.ac.destination);
+  }
+  toggleMute() {
+    this.mute = !this.mute;
+    this.muteButton.classList.toggle('active');
+    this.updateEffectivelyMute();
+  }
+  toggleSolo() {
+    this.solo = !this.solo;
+    this.soloButton.classList.toggle('active');
+    if (this.solo)
+      soloTracks.add(this);
+    else
+      soloTracks.delete(this);
+    for (const track of allTracks)
+      track.updateEffectivelyMute();
+  }
+  getFreqBuf() {
+    this.analyzer.getByteFrequencyData(this.freqBuf);
+    return this.freqBuf;
+  }
+  getDrawRect() {
+    const canvas = this.canvasPlaceholderEl;
+    return [canvas.offsetLeft, canvas.offsetTop, canvas.offsetWidth, canvas.offsetHeight];
+  }
+  play(now, startTime) {
+    this.stop();
+    const node = ac.createBufferSource();
+    node.buffer = this.buf;
+    node.connect(this.analyzer);
+    node.connect(this.ac.destination);
+    node.start(now, startTime);
+    this.node = node;
+  }
+  stop() {
+    if (!this.node)
+      return;
+    this.node.stop();
+    this.node = null;
+  }
+}
+
+let ac;
+
+const loadStems = async files => {
+  ac = new AudioContext();
+  const bufs = await Promise.all(Array.from(files).map(async f =>
+    [f.name, await ac.decodeAudioData(await f.arrayBuffer())]
+  ));
+  document.body.dataset.state = 'loaded';
+  requestAnimationFrame(() => {
+    spectrumViewer.resize();
+  });
+  spectrumViewer.onAnimationFrame();
+  const players = bufs.map(buf => new StemPlayer(ac, ...buf));
+  const transport = new Transport(ac, players);
+  for (const player of players)
+    tracks.appendChild(player.el);
+  for (const player of players)
+    spectrumViewer.players.push(player);
+  document.body.appendChild(transport.el);
+  transport.play();
+};
+
+dropzone.addEventListener('dragover', e => {
+  e.preventDefault();
+  event.dataTransfer.dropEffect = 'copy';
+});
+
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  document.body.dataset.state = 'loading';
+  loadStems(event.dataTransfer.files);
+});
+
+</script>
