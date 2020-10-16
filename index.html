@@ -147,7 +147,10 @@ class Transport {
     this.el.querySelector('.totalTime').textContent = formatDuration(this.duration);
     this.scrubber.max = this.duration;
     this.scrubber.addEventListener('input', e => {
-      this.play();
+      if (this.startTime != null)
+        this.play();
+      else
+        this.updateTransport();
     });
     this.playPauseButton = this.el.querySelector('.playPause');
     this.playPauseButton.addEventListener('click', e => {
