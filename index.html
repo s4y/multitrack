@@ -333,6 +333,8 @@ class StemPlayer {
     this.el.querySelector('.label').textContent = name;
 
     this.analyzer = ac.createAnalyser();
+    this.analyzer.smoothingTimeConstant = 0;
+    this.analyzer.fftSize = 4096;
     this.freqBuf = new Uint8Array(Math.floor(kMaxFrequency / ac.sampleRate * (this.analyzer.fftSize / 2)));
 
     this.muteButton = this.el.querySelector('.mute');
