@@ -392,7 +392,8 @@ class StemPlayer {
     const node = ac.createBufferSource();
     node.buffer = this.buf;
     node.connect(this.analyzer);
-    node.connect(this.ac.destination);
+    if (!this.effectivelyMute)
+      node.connect(this.ac.destination);
     node.start(now, startTime);
     this.node = node;
   }
