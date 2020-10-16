@@ -163,9 +163,10 @@ class Transport {
   updateTransport() {
     const playing = this.startTime != null;
     this.playPauseButton.textContent = playing ? 'Pause' : 'Play';
-    const currentTime = playing ? ac.currentTime - this.startTime : 0;
-      if (playing && currentTime > this.duration) {
+    const currentTime = playing ? ac.currentTime - this.startTime : this.scrubber.valueAsNumber;
+    if (playing && currentTime > this.duration) {
       this.startTime = null;
+      this.scrubber.valueAsNumber = 0;
       this.updateTransport();
       return;
     }
